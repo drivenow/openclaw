@@ -91,6 +91,59 @@ Other config knobs that affect tool availability:
 - `tools.byProvider` / `agents.list[].tools.byProvider` (provider‑specific allow/deny)
 - `tools.sandbox.tools.*` (sandbox tool policy when sandboxed)
 
+## Policy boundaries (`tools.profile`, `tools.allow`, `tools.alsoAllow`)
+
+Use these three fields for different goals:
+
+- `tools.profile`: base tool set (`minimal`, `coding`, `messaging`, `full`).
+- `tools.allow`: explicit allowlist policy (can act as plugin opt-in source).
+- `tools.alsoAllow`: additive entries on top of a profile without replacing it.
+
+Important boundary for plugin tools:
+
+- **Optional plugin tools still need an explicit `allow` entry** (tool name, plugin id, or `group:plugins`).
+- `alsoAllow` is additive for policy filtering, but it is not the primary opt-in source for optional plugin tool registration.
+
+Config rule:
+
+- You cannot set `allow` and `alsoAllow` in the same scope (`tools` or `agents.list[].tools`).
+
+Recommended patterns:
+
+1. Additive enablement (keep profile behavior):
+
+```json5
+{
+  tools: {
+    profile: "minimal",
+    alsoAllow: ["memory_search", "memory_get"],
+  },
+}
+```
+
+2. Optional plugin tool opt-in:
+
+```json5
+{
+  agents: {
+    list: [
+      {
+        id: "main",
+        tools: {
+          allow: ["workflow_tool"], // optional plugin tool
+        },
+      },
+    ],
+  },
+}
+```
+
+If logs show `allowlist contains unknown entries (...)`:
+
+1. Verify tool spelling.
+2. Verify the plugin is enabled/loaded.
+3. Re-check whether the entry belongs in `allow` (optional tool opt-in) or `alsoAllow` (additive filtering).
+
 ## Rules + tips
 
 - Tool names must **not** clash with core tool names; conflicting tools are skipped.

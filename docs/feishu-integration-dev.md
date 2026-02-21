@@ -2,6 +2,29 @@
 
 > 本文档面向开发者，记录飞书（Feishu/Lark）接入 OpenClaw 的完整技术实现细节，包括架构设计、源码走读、Cron 推送集成、排障经验以及可复用的开发模式。
 > 用户侧操作指南请参考 [飞书用户文档](/zh-CN/channels/feishu)。
+> 如果你是第一次排障，先看 [Feishu MCP Memory 新手闭坑指南](/feishu-mcp-memory-newbie-guide)。
+
+---
+
+## 0. 新手快查入口（10 分钟版）
+
+先按这个顺序跑，不要一次改多个配置项：
+
+```bash
+openclaw gateway status
+openclaw channels status --probe
+openclaw logs --follow
+openclaw pairing list feishu
+openclaw doctor
+```
+
+快速判定法：
+
+1. 日志看到 `received message from`：飞书入站已通，问题不在“收消息”。
+2. 日志看到 `dispatching to agent`：路由已命中，继续查工具或回传。
+3. 日志看到 `dispatch complete` 但群里没显示：优先查发送权限或目标会话。
+4. 日志看到 `skipping duplicate message`：这是幂等命中，不是消息丢失。
+5. 日志看到 `allowlist contains unknown entries`：先校正工具名/插件启用状态，不一定阻断主链路。
 
 ---
 
@@ -355,6 +378,18 @@ sequenceDiagram
 ---
 
 ## 6. 排障手册
+
+### 6.0 先按层定位，不要盲改配置
+
+建议每次只定位一层：
+
+1. 接入层：是否出现 `received message from`
+2. 路由层：是否出现 `dispatching to agent`
+3. 工具层：是否出现工具缺失/unknown allowlist 警告
+4. 异步层：是否出现 worker 启动与结束日志
+5. 回传层：是否出现发送成功或降级发送日志
+
+如果你需要按步骤卡片执行，直接看 [Feishu MCP Memory 新手闭坑指南](/feishu-mcp-memory-newbie-guide)。
 
 ### 6.1 DNS 解析失败 (`ENOTFOUND open.feishu.cn`)
 
