@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "rag-memory-server": {
+      "command": "python3",
+      "args": ["/Users/fullmetal/Documents/RAG/scripts/mcp_rag_server.py"]
+    }
+  },
+  "imports": []
+}

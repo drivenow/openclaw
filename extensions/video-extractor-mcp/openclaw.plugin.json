@@ -1,0 +1,35 @@
+{
+  "id": "video-extractor",
+  "name": "Video Extractor",
+  "description": "Extract video text via Python worker and deliver markdown results back to Feishu.",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "pythonBin": {
+        "type": "string",
+        "description": "Python executable path (default: python3)."
+      },
+      "workerScript": {
+        "type": "string",
+        "description": "Absolute path to video_extractor_mcp.py worker script."
+      },
+      "rpaDir": {
+        "type": "string",
+        "description": "Absolute path to the RPA project containing demo_mcp.py."
+      },
+      "outputDir": {
+        "type": "string",
+        "description": "Directory where extracted markdown files are written."
+      },
+      "timeoutMinutes": {
+        "type": "number",
+        "description": "Worker timeout in minutes (default: 30)."
+      },
+      "notifyFeishu": {
+        "type": "boolean",
+        "description": "Whether to push completion/failure notifications to Feishu (default: true)."
+      }
+    }
+  }
+}

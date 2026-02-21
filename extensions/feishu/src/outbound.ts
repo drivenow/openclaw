@@ -3,6 +3,21 @@ import { sendMediaFeishu } from "./media.js";
 import { getFeishuRuntime } from "./runtime.js";
 import { sendMessageFeishu } from "./send.js";
 
+function buildMediaFallbackText(mediaUrl: string, err: unknown): string {
+  const errObj = err as {
+    message?: string;
+    response?: { data?: { msg?: string } };
+  };
+  const apiMsg = errObj.response?.data?.msg ?? "";
+  const rawMsg = apiMsg || errObj.message || "unknown error";
+  const needsResourceScope =
+    rawMsg.includes("im:resource:upload") || rawMsg.includes("im:resource");
+  const hint = needsResourceScope
+    ? "附件发送失败：飞书应用缺少权限（im:resource:upload / im:resource）。"
+    : `附件发送失败：${rawMsg}`;
+  return `${hint}\n📎 ${mediaUrl}`;
+}
+
 export const feishuOutbound: ChannelOutboundAdapter = {
   deliveryMode: "direct",
   chunker: (text, limit) => getFeishuRuntime().channel.text.chunkMarkdownText(text, limit),
@@ -32,7 +47,7 @@ export const feishuOutbound: ChannelOutboundAdapter = {
         // Log the error for debugging
         console.error(`[feishu] sendMediaFeishu failed:`, err);
         // Fallback to URL link if upload fails
-        const fallbackText = `📎 ${mediaUrl}`;
+        const fallbackText = buildMediaFallbackText(mediaUrl, err);
         const result = await sendMessageFeishu({
           cfg,
           to,

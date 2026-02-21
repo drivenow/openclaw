@@ -169,9 +169,14 @@ export function stripPluginOnlyAllowlist(
       hasCoreEntry = true;
       continue;
     }
-    const isPluginEntry =
-      entry === "group:plugins" || pluginIds.has(entry) || pluginTools.has(entry);
     const expanded = expandToolGroups([entry]);
+    const expandsToPluginToolsOnly =
+      expanded.length > 0 && expanded.every((tool) => pluginTools.has(tool));
+    const isPluginEntry =
+      entry === "group:plugins" ||
+      pluginIds.has(entry) ||
+      pluginTools.has(entry) ||
+      expandsToPluginToolsOnly;
     const isCoreEntry = expanded.some((tool) => coreTools.has(tool));
     if (isCoreEntry) {
       hasCoreEntry = true;
