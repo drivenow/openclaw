@@ -1,0 +1,124 @@
+# 飞书 App 接入 OpenClaw —— 开发方案 (Native Plugin 版)
+
+## 核心变更说明
+
+> [!CAUTION]
+> **方案逆转**：此前的“独立 Bridge”方案作废。
+> **原因分析**：经过源码审查，发现 OpenClaw 官方已经提供了完整的原生飞书插件（`extensions/feishu`），具备收发消息、WebSocket 长连接 (`monitor.ts`)、路由控制、白名单以及事件幂等去重等一切能力。重复造轮子没有意义且风险高。
+> **新方向**：直接安装并配置原生 Feishu 插件，并将 Cron 任务的 Webhook delivery 改为原生的 `announce` delivery。
+
+---
+
+## 架构设计
+
+原生插件集成架构如下：
+
+```mermaid
+flowchart LR
+    subgraph 飞书
+        U[用户<br/>手机/PC]
+        FS[飞书开放平台]
+    end
+    subgraph 你的服务器 (OpenClaw)
+        GW["Gateway (Core)"]
+        Plugin["Feishu Plugin<br/>(extensions/feishu)"]
+        Cron["Cron Runner"]
+    end
+
+    U -->|对话/命令| FS
+    FS -.->|"WS 长连接监听"| Plugin
+    Plugin <-->|"Native IPC"| GW
+    Cron -->|"执行完毕"| GW
+    GW -->|"调用 sendText/sendMedia"| Plugin
+    Plugin -->|"调用飞书 SDK"| FS
+    FS -->|推送| U
+```
+
+### 两条通路原生实现
+
+1. **用户对话（双向）**：
+   飞书原生插件使用 `@larksuiteoapi/node-sdk` 的 `WSClient` 维持长连接。接收事件在 `monitor.ts` 中处理，去重并转交给 Gateway 的事件流（免去了 `chat.send` RPC 等复杂的连接管理），Gateway 的回复直接通过 `outbound.ts` 中的 `sendText` 推送回飞书。
+2. **Cron 推送（单向）**：
+   修改 `jobs.json` 中的 cron 配置，将 `delivery.mode` 由 `"webhook"` / `"none"` 更改为 `"announce"`，指定 `channel: "feishu"` 以及目标用户的 ID (`to: "ou_xxx"` 或 `to: "oc_xxx"`)。任务执行完毕后，Gateway 原生路由消息给飞书插件发出，完全避免走 127.0.0.1 产生的 SSRF 拦截问题。
+
+---
+
+## 实施清单 (Action Items)
+
+### 1. 飞书开放平台配置（需要用户操作）
+进入飞书开放平台 [open.feishu.cn](https://open.feishu.cn/)：
+- **创建自建企业应用**
+- **获取凭证**：App ID 和 App Secret。
+- **权限配置**：添加 `im:message`（接收消息）、`im:message:send_as_bot`（发送消息）。
+- **事件订阅**：添加 `im.message.receive_v1` 事件。选择长连接模式（在此模式下无需配置回调 URL 和验证 Token 签名）。
+- **发布应用**：创建版本并发布即可生效。
+
+### 2. 启用并在 OpenClaw 配置 Feishu 插件
+安装官方 Feishu 插件（如果按现有源码结构已包含在 `extensions/feishu`）：
+```bash
+openclaw plugins install ./extensions/feishu
+# 或
+openclaw plugins install @openclaw/feishu
+```
+
+在全局配置（`openclaw.json5` 或相关配置文件）中添加：
+
+```json5
+{
+  channels: {
+    feishu: {
+      enabled: true,
+      appId: "cli_xxx",       // 替换为真实的 App ID
+      appSecret: "yyy",       // 替换为真实的 App Secret
+      connectionMode: "websocket", // 使用长连接避免公网 IP
+      domain: "feishu",
+      groupPolicy: "open",    // 允许任何群组，或者改为 allowlist
+      groups: {
+        // 如果加入飞书群，默认必须 @ 机器人才理睬；可以设为 false 监听所有群消息
+        // "default": { requireMention: false }
+      }
+    }
+  }
+}
+```
+
+> [!TIP]
+> 安全起见，建议不要在配置文件明文写 `appSecret`，可通过环境变量注入，或将其作为 OpenClaw secrets 管理。
+
+### 3. 修改 Cron 任务分发目标
+找到 `~/.openclaw/cron/jobs.json` 里的对应任务，修改 `delivery` 字段：
+
+```diff
+-  "delivery": {
+-    "mode": "none",
+-    "channel": "last"
+-  },
++  "delivery": {
++    "mode": "announce",
++    "channel": "feishu",
++    "to": "ou_xxx"       // 这里填你的飞书 Open ID，或者群 chat_id "oc_xxx"
++  },
+```
+
+### 4. 获取用户/群 ID，通过 Pairing 绑定
+- Gateway 启动后，通过飞书给机器人发一句随便什么话。
+- 机器人会默认开启配对模式，回复你一个 `CODE`（包含你的 `ou_...` ID）。飞书群聊则为 `oc_...`。
+- 在命令行执行 `openclaw pairing approve feishu <CODE>` 绑定身份。
+- 将输出的 ID 填入上面 Cron 任务的 `to` 字段。
+
+---
+
+## 评估与解答 (针对用户的顾虑)
+
+1. **[P0] 重复建设风险**：方案已完全迁移至复用现存插件 (`extensions/feishu`)，无独立 bridge 开发工作，复用原生飞书模块的白名单/配对/长连接机制。
+2. **[P0] chat.send + expectFinal 设计不成立**：无需我们手工处理 WebSocket，原生飞书插件作为内部 Channel 已完整实现事件流消费。
+3. **[P1] Cron SSRF 防护拦截**：通过直接将 cron 投递模式改为内部发送通道 `announce` (`delivery.mode: "announce"`) 结合 `channel: "feishu"`，不再需要 webhook 绕弯路进行远程调用，绕过了 SSRF 限流和检测。
+4. **[P1] 缺少事件幂等与重试**：交给原生 Feishu Plugin 的 `monitor.ts` 与底层 Gateway 处理（内置的重试与幂等机制将保证消息不漏不重）。
+
+---
+
+## 下一步
+
+这套方案只需**配置**而基本不需要**写新代码**。
+1. 请您按“实施清单”第一步在飞书后台**建号、获取 App ID 和 Secret、开长连接和权限**。
+2. 告诉我凭证（或自行写入配置），然后我帮您修改 OpenClaw 配置与 Cron 执行方式，完成接通。
