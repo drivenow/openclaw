@@ -172,6 +172,7 @@ export const FeishuConfigSchema = z
     groupPolicy: GroupPolicySchema.optional().default("allowlist"),
     requireMention: z.boolean().optional().default(true),
     topicSessionMode: TopicSessionModeSchema,
+
     // Dynamic agent creation for DM users
     dynamicAgentCreation: DynamicAgentCreationSchema,
     // Multi-account configuration

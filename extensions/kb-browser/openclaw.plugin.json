@@ -1,0 +1,26 @@
+{
+  "id": "kb-browser",
+  "name": "KB Browser",
+  "description": "Browse whitelisted knowledge-base directories with slash commands.",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "roots": {
+        "type": "array",
+        "description": "Allowed root directories for /kb browsing.",
+        "items": {
+          "type": "string"
+        }
+      },
+      "pageSize": {
+        "type": "number",
+        "description": "Items per page (default: 20)."
+      },
+      "searchMaxResults": {
+        "type": "number",
+        "description": "Maximum recursive search matches (default: 500)."
+      }
+    }
+  }
+}

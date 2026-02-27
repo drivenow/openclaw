@@ -10,6 +10,7 @@ const resolveReceiveIdTypeMock = vi.hoisted(() => vi.fn());
 const loadWebMediaMock = vi.hoisted(() => vi.fn());
 
 const fileCreateMock = vi.hoisted(() => vi.fn());
+const imageCreateMock = vi.hoisted(() => vi.fn());
 const imageGetMock = vi.hoisted(() => vi.fn());
 const messageCreateMock = vi.hoisted(() => vi.fn());
 const messageResourceGetMock = vi.hoisted(() => vi.fn());
@@ -70,6 +71,7 @@ describe("sendMediaFeishu msg_type routing", () => {
           create: fileCreateMock,
         },
         image: {
+          create: imageCreateMock,
           get: imageGetMock,
         },
         message: {
@@ -85,6 +87,10 @@ describe("sendMediaFeishu msg_type routing", () => {
     fileCreateMock.mockResolvedValue({
       code: 0,
       data: { file_key: "file_key_1" },
+    });
+    imageCreateMock.mockResolvedValue({
+      code: 0,
+      data: { image_key: "img_key_1" },
     });
 
     messageCreateMock.mockResolvedValue({
@@ -207,6 +213,50 @@ describe("sendMediaFeishu msg_type routing", () => {
     expect(fileCreateMock).not.toHaveBeenCalled();
     expect(messageCreateMock).not.toHaveBeenCalled();
     expect(messageReplyMock).not.toHaveBeenCalled();
+  });
+
+  it("blocks sensitive local files from outbound media", async () => {
+    await expect(
+      sendMediaFeishu({
+        cfg: {} as any,
+        to: "user:ou_target",
+        mediaUrl: "/tmp/.env",
+      }),
+    ).rejects.toThrow(/sensitive local file/i);
+
+    expect(loadWebMediaMock).not.toHaveBeenCalled();
+    expect(fileCreateMock).not.toHaveBeenCalled();
+    expect(messageCreateMock).not.toHaveBeenCalled();
+  });
+
+  it("allows local files from configured outbound roots", async () => {
+    loadWebMediaMock.mockResolvedValueOnce({
+      buffer: Buffer.from("safe-image"),
+      fileName: "safe.png",
+      kind: "image",
+      contentType: "image/png",
+    });
+
+    const safePath = "/tmp/openclaw-safe/safe.png";
+    await sendMediaFeishu({
+      cfg: {} as any,
+      to: "user:ou_target",
+      mediaUrl: safePath,
+    });
+
+    expect(loadWebMediaMock).toHaveBeenCalledWith(
+      safePath,
+      expect.objectContaining({
+        optimizeImages: false,
+        localRoots: expect.arrayContaining([path.resolve("/tmp")]),
+      }),
+    );
+    expect(imageCreateMock).toHaveBeenCalled();
+    expect(messageCreateMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ msg_type: "image" }),
+      }),
+    );
   });
 
   it("uses isolated temp paths for image downloads", async () => {

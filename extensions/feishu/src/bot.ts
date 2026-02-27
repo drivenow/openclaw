@@ -652,6 +652,10 @@ export async function handleFeishuMessage(params: {
       groupConfig,
     });
 
+    log(
+      `feishu[${account.accountId}]: DEBUG requireMention=${requireMention} mentionedBot=${ctx.mentionedBot} chatId=${ctx.chatId}`,
+    );
+
     if (requireMention && !ctx.mentionedBot) {
       log(
         `feishu[${account.accountId}]: message in group ${ctx.chatId} did not mention bot, recording to history`,

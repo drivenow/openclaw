@@ -1,6 +1,5 @@
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { readFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -33,8 +32,12 @@ type WorkerResult = {
   message?: string;
   title?: string;
   url?: string;
+  txt_path?: string;
   md_path?: string;
   text_file_path?: string;
+  polish_status?: string;
+  polish_warning?: string;
+  polish_failed_chunks?: number;
 };
 
 type JobSummary = {
@@ -46,6 +49,7 @@ type JobSummary = {
   startedAt: number;
   finishedAt?: number;
   message?: string;
+  txtPath?: string;
   mdPath?: string;
 };
 
@@ -55,16 +59,19 @@ const COMPLETION_CACHE_TTL_MS = 12 * 60 * 60 * 1000;
 const RUNNING_JOB_STALE_GRACE_MS = 5 * 60 * 1000;
 
 const EXTRACT_VIDEO_TEXT_SCHEMA = Type.Object({
-  url: Type.String({ description: "Video URL (Bilibili/YouTube)." }),
+  url: Type.String({
+    description:
+      "Video URL or Douyin share text (Bilibili/YouTube/Douyin). For Douyin, you can pass the share text containing a short link — it will be resolved automatically.",
+  }),
   title: Type.Optional(Type.String({ description: "Optional video title." })),
 });
 
 function resolveDefaultOutputDir(api: OpenClawPluginApi): string {
   const workspace = api.config?.agents?.defaults?.workspace;
   if (typeof workspace === "string" && workspace.trim()) {
-    return path.resolve(workspace.trim(), "memory", "rag");
+    return path.resolve(workspace.trim(), "memory", "video");
   }
-  return path.join(os.homedir(), ".openclaw", "workspace", "memory", "rag");
+  return path.join(os.homedir(), ".openclaw", "workspace", "memory", "video");
 }
 
 function resolvePluginConfig(api: OpenClawPluginApi): ResolvedPluginConfig {
@@ -224,48 +231,32 @@ async function notifyFeishuCompletion(params: {
   result: WorkerResult;
 }) {
   const message = `✅ 视频《${params.title}》文本提取完成。\n来源：${params.url}`;
+  const polishWarning = params.result.polish_warning?.trim();
+  const txtPath = params.result.txt_path?.trim();
   const mdPath = params.result.md_path?.trim();
+  const attachmentPath = txtPath || mdPath;
+  const warningLine = polishWarning ? `\n⚠️ 润色告警：${polishWarning}` : "";
+  const intro = `${message}${warningLine}`;
 
-  if (mdPath) {
+  if (attachmentPath) {
     try {
       await sendMessage({
         cfg: params.api.config ?? {},
         channel: "feishu",
         to: params.target.to,
         accountId: params.target.accountId,
-        content: message,
-        mediaUrl: mdPath,
+        content: intro,
+        mediaUrl: attachmentPath,
       });
       return;
     } catch (err) {
       params.api.logger.warn(
         `[video-extractor] completion attachment send failed, fallback to text: ${String(err)}`,
       );
-      try {
-        const rawMd = await readFile(mdPath, "utf-8");
-        const trimmedMd = rawMd.trim();
-        if (trimmedMd) {
-          const maxChars = 12000;
-          const body =
-            trimmedMd.length > maxChars
-              ? `${trimmedMd.slice(0, maxChars)}\n\n(内容较长，已截断；完整文件路径：${mdPath})`
-              : trimmedMd;
-          await sendMessage({
-            cfg: params.api.config ?? {},
-            channel: "feishu",
-            to: params.target.to,
-            accountId: params.target.accountId,
-            content: `${message}\n⚠️ 附件上传不可用，已改为正文发送：\n\n${body}`,
-          });
-          return;
-        }
-      } catch (readErr) {
-        params.api.logger.warn(`[video-extractor] md read fallback failed: ${String(readErr)}`);
-      }
     }
   }
 
-  const fallbackMessage = mdPath ? `${message}\n文档路径：${mdPath}` : message;
+  const fallbackMessage = attachmentPath ? `${intro}\n文件路径：${attachmentPath}` : intro;
   await sendMessage({
     cfg: params.api.config ?? {},
     channel: "feishu",
@@ -393,6 +384,7 @@ function runBackgroundJob(params: {
 
   child.on("close", async (code, signal) => {
     clearTimeout(timeout);
+    activeJobsByUrl.delete(urlKey);
 
     const parsed = parseWorkerResult(stdout);
     const success = Boolean(parsed?.success);
@@ -403,7 +395,6 @@ function runBackgroundJob(params: {
         : `worker exited with code=${String(code)} signal=${String(signal)}`);
 
     if (success) {
-      activeJobsByUrl.delete(urlKey);
       latestJobsByUrl.set(urlKey, {
         jobId,
         status: "completed",
@@ -413,6 +404,7 @@ function runBackgroundJob(params: {
         startedAt,
         finishedAt: Date.now(),
         message: parsed?.message,
+        txtPath: parsed?.txt_path?.trim() || undefined,
         mdPath: parsed?.md_path?.trim() || undefined,
       });
       api.logger.info(`${prefix} completed successfully`);
@@ -432,7 +424,6 @@ function runBackgroundJob(params: {
       return;
     }
 
-    activeJobsByUrl.delete(urlKey);
     latestJobsByUrl.set(urlKey, {
       jobId,
       status: "failed",
@@ -514,7 +505,7 @@ function createExtractVideoTextTool(params: {
       }
 
       const recentDone = readRecentCompletedJob(urlKey);
-      if (recentDone && recentDone.mdPath) {
+      if (recentDone && (recentDone.txtPath || recentDone.mdPath)) {
         const feishuTarget = pluginConfig.notifyFeishu
           ? resolveFeishuDelivery(toolContext.sessionKey)
           : null;
@@ -525,7 +516,10 @@ function createExtractVideoTextTool(params: {
               target: feishuTarget,
               title: recentDone.title,
               url: recentDone.url,
-              result: { md_path: recentDone.mdPath },
+              result: {
+                txt_path: recentDone.txtPath,
+                md_path: recentDone.mdPath,
+              },
             });
           } catch (err) {
             api.logger.warn(
@@ -537,7 +531,7 @@ function createExtractVideoTextTool(params: {
           content: [
             {
               type: "text",
-              text: `✅ 这个视频已提取完成（jobId=${recentDone.jobId}），已尝试重新回传结果。文档路径：${recentDone.mdPath}`,
+              text: `✅ 这个视频已提取完成（jobId=${recentDone.jobId}），已尝试重新回传结果。文件路径：${recentDone.txtPath ?? recentDone.mdPath}`,
             },
           ],
           details: {
@@ -546,6 +540,7 @@ function createExtractVideoTextTool(params: {
             jobId: recentDone.jobId,
             status: "completed",
             title: recentDone.title,
+            txtPath: recentDone.txtPath,
             mdPath: recentDone.mdPath,
           },
         };

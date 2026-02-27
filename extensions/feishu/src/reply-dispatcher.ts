@@ -1,3 +1,7 @@
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import {
   createReplyPrefixContext,
   createTypingCallbacks,
@@ -8,6 +12,7 @@ import {
 } from "openclaw/plugin-sdk";
 import { resolveFeishuAccount } from "./accounts.js";
 import { createFeishuClient } from "./client.js";
+import { sendMediaFeishu } from "./media.js";
 import type { MentionTarget } from "./mention.js";
 import { buildMentionedCardContent } from "./mention.js";
 import { getFeishuRuntime } from "./runtime.js";
@@ -19,6 +24,113 @@ import { addTypingIndicator, removeTypingIndicator, type TypingIndicatorState } 
 /** Detect if text contains markdown elements that benefit from card rendering */
 function shouldUseCard(text: string): boolean {
   return /```[\s\S]*?```/.test(text) || /\|.+\|[\r\n]+\|[-:| ]+\|/.test(text);
+}
+
+const IMAGE_EXT_RE = /\.(png|jpe?g|gif|webp|bmp|ico|tiff?)$/i;
+const BACKTICK_TEXT_RE = /`([^`\n]+)`/g;
+const MARKDOWN_IMAGE_RE = /!\[[^\]]*]\(([^)\n]+)\)/g;
+const TMP_IMAGE_PATH_RE =
+  /\/(?:tmp|private\/tmp|var\/folders)\/[^\s`"'<>()[\]{}]+\.(?:png|jpe?g|gif|webp|bmp|ico|tiff?)/gi;
+const MEDIA_MARKER_RE = /^MEDIA\s*:\s*(.+)$/i;
+
+function stripSurroundingQuotes(value: string): string {
+  return value
+    .trim()
+    .replace(/^[<"'`[\]({]+/, "")
+    .replace(/[>"'`\])}]+$/, "");
+}
+
+function resolveLocalPathFromText(value: string): string | undefined {
+  const trimmed = stripSurroundingQuotes(value);
+  if (!trimmed) {
+    return undefined;
+  }
+  if (trimmed.startsWith("file://")) {
+    try {
+      return path.resolve(fileURLToPath(trimmed));
+    } catch {
+      return undefined;
+    }
+  }
+  if (trimmed.startsWith("~/")) {
+    return path.resolve(path.join(os.homedir(), trimmed.slice(2)));
+  }
+  if (path.isAbsolute(trimmed)) {
+    return path.resolve(trimmed);
+  }
+  return undefined;
+}
+
+function isExistingLocalImageFile(localPath: string): boolean {
+  if (!IMAGE_EXT_RE.test(localPath)) {
+    return false;
+  }
+  try {
+    const stat = fs.statSync(localPath);
+    return stat.isFile();
+  } catch {
+    return false;
+  }
+}
+
+function extractLocalImageMediaFromText(text: string): string[] {
+  if (!text) {
+    return [];
+  }
+
+  const mediaUrls = new Set<string>();
+  const addLocalCandidate = (candidate: string) => {
+    const localPath = resolveLocalPathFromText(candidate);
+    if (!localPath || !isExistingLocalImageFile(localPath)) {
+      return;
+    }
+    mediaUrls.add(localPath);
+  };
+
+  for (const match of text.matchAll(BACKTICK_TEXT_RE)) {
+    addLocalCandidate(match[1] ?? "");
+  }
+
+  for (const match of text.matchAll(MARKDOWN_IMAGE_RE)) {
+    const raw = stripSurroundingQuotes(match[1] ?? "");
+    if (!raw) {
+      continue;
+    }
+    const [firstToken] = raw.split(/\s+/, 1);
+    addLocalCandidate(firstToken ?? raw);
+  }
+
+  for (const match of text.matchAll(TMP_IMAGE_PATH_RE)) {
+    addLocalCandidate(match[0] ?? "");
+  }
+
+  return [...mediaUrls];
+}
+
+function extractMediaMarkersFromText(text: string): { cleanedText: string; mediaUrls: string[] } {
+  if (!text) {
+    return { cleanedText: "", mediaUrls: [] };
+  }
+
+  const mediaUrls = new Set<string>();
+  const keptLines: string[] = [];
+  for (const rawLine of text.split(/\r?\n/)) {
+    const match = MEDIA_MARKER_RE.exec(rawLine.trim());
+    if (!match) {
+      keptLines.push(rawLine);
+      continue;
+    }
+    const candidate = stripSurroundingQuotes(match[1] ?? "");
+    if (candidate) {
+      mediaUrls.add(candidate);
+    }
+  }
+
+  const cleanedText = keptLines
+    .join("\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+  return { cleanedText, mediaUrls: [...mediaUrls] };
 }
 
 export type CreateFeishuReplyDispatcherParams = {
@@ -137,61 +249,122 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
         void typingCallbacks.onReplyStart?.();
       },
       deliver: async (payload: ReplyPayload, info) => {
-        const text = payload.text ?? "";
-        if (!text.trim()) {
+        if (info?.kind && info.kind !== "final") {
           return;
         }
 
-        const useCard = renderMode === "card" || (renderMode === "auto" && shouldUseCard(text));
+        const parsed = extractMediaMarkersFromText(payload.text ?? "");
+        const text = parsed.cleanedText;
+        const markerMediaUrls = parsed.mediaUrls;
+        const payloadMediaUrls = payload.mediaUrls?.length
+          ? payload.mediaUrls
+          : payload.mediaUrl
+            ? [payload.mediaUrl]
+            : [];
+        const explicitMediaUrls = markerMediaUrls.length > 0 ? markerMediaUrls : payloadMediaUrls;
+        const inferredLocalMediaUrls =
+          explicitMediaUrls.length > 0 ? [] : extractLocalImageMediaFromText(text);
+        const mediaUrls = explicitMediaUrls.length > 0 ? explicitMediaUrls : inferredLocalMediaUrls;
+        const hasMedia = mediaUrls.length > 0;
 
-        if ((info?.kind === "block" || info?.kind === "final") && streamingEnabled && useCard) {
-          startStreaming();
-          if (streamingStartPromise) {
-            await streamingStartPromise;
-          }
-        }
-
-        if (streaming?.isActive()) {
-          if (info?.kind === "final") {
-            streamText = text;
-            await closeStreaming();
-          }
+        if (!text.trim() && !hasMedia) {
           return;
         }
 
-        let first = true;
-        if (useCard) {
-          for (const chunk of core.channel.text.chunkTextWithMode(
-            text,
-            textChunkLimit,
-            chunkMode,
-          )) {
-            await sendMarkdownCardFeishu({
-              cfg,
-              to: chatId,
-              text: chunk,
-              replyToMessageId,
-              mentions: first ? mentionTargets : undefined,
-              accountId,
-            });
-            first = false;
+        if (markerMediaUrls.length > 0) {
+          params.runtime.log?.(
+            `feishu[${account.accountId}] detected ${markerMediaUrls.length} MEDIA marker(s)`,
+          );
+        }
+
+        if (inferredLocalMediaUrls.length > 0) {
+          params.runtime.log?.(
+            `feishu[${account.accountId}] inferred ${inferredLocalMediaUrls.length} local image media path(s) from text`,
+          );
+        }
+
+        // Handle text delivery
+        if (text.trim()) {
+          const useCard = renderMode === "card" || (renderMode === "auto" && shouldUseCard(text));
+
+          if (streamingEnabled && useCard) {
+            startStreaming();
+            if (streamingStartPromise) {
+              await streamingStartPromise;
+            }
           }
-        } else {
-          const converted = core.channel.text.convertMarkdownTables(text, tableMode);
-          for (const chunk of core.channel.text.chunkTextWithMode(
-            converted,
-            textChunkLimit,
-            chunkMode,
-          )) {
-            await sendMessageFeishu({
-              cfg,
-              to: chatId,
-              text: chunk,
-              replyToMessageId,
-              mentions: first ? mentionTargets : undefined,
-              accountId,
-            });
-            first = false;
+
+          if (streaming?.isActive()) {
+            if (info?.kind === "final") {
+              streamText = text;
+              await closeStreaming();
+            }
+            // Still send media even when streaming handles text
+            if (hasMedia) {
+              for (const mediaUrl of mediaUrls) {
+                try {
+                  await sendMediaFeishu({ cfg, to: chatId, mediaUrl, replyToMessageId, accountId });
+                } catch (err) {
+                  params.runtime.error?.(
+                    `feishu[${account.accountId}] media send failed: ${String(err)}`,
+                  );
+                  // Fallback: send the URL as text
+                  await sendMessageFeishu({ cfg, to: chatId, text: `📎 ${mediaUrl}`, accountId });
+                }
+              }
+            }
+            return;
+          }
+
+          let first = true;
+          if (useCard) {
+            for (const chunk of core.channel.text.chunkTextWithMode(
+              text,
+              textChunkLimit,
+              chunkMode,
+            )) {
+              await sendMarkdownCardFeishu({
+                cfg,
+                to: chatId,
+                text: chunk,
+                replyToMessageId,
+                mentions: first ? mentionTargets : undefined,
+                accountId,
+              });
+              first = false;
+            }
+          } else {
+            const converted = core.channel.text.convertMarkdownTables(text, tableMode);
+            for (const chunk of core.channel.text.chunkTextWithMode(
+              converted,
+              textChunkLimit,
+              chunkMode,
+            )) {
+              await sendMessageFeishu({
+                cfg,
+                to: chatId,
+                text: chunk,
+                replyToMessageId,
+                mentions: first ? mentionTargets : undefined,
+                accountId,
+              });
+              first = false;
+            }
+          }
+        }
+
+        // Handle media delivery (images, files, etc.)
+        if (hasMedia) {
+          for (const mediaUrl of mediaUrls) {
+            try {
+              await sendMediaFeishu({ cfg, to: chatId, mediaUrl, replyToMessageId, accountId });
+            } catch (err) {
+              params.runtime.error?.(
+                `feishu[${account.accountId}] media send failed: ${String(err)}`,
+              );
+              // Fallback: send the URL as text
+              await sendMessageFeishu({ cfg, to: chatId, text: `📎 ${mediaUrl}`, accountId });
+            }
           }
         }
       },

@@ -67,6 +67,57 @@ memory 分两层，都是 workspace 目录下的普通 Markdown 文件：
 - 想让某件事被长期记住，明确告诉 agent "记住这个"，它会写入 `MEMORY.md`
 - **群聊里不会加载 `MEMORY.md`**，这是设计行为，避免私人信息泄漏到群组上下文
 
+### 4. Memory 插件的两层架构（深入理解）
+
+> 上面第 3 点介绍了文件级的记忆管理，这里进一步解释背后的 **插件级** 实现原理。
+
+OpenClaw 的记忆能力由两个插件协作提供，都是 **TypeScript 代码实现**（不是 Skills 提示词）：
+
+```
+memory-core（核心层）
+  → 注册 memory_search / memory_get 工具
+  → 后端：~/.openclaw/memory/main.sqlite（QMD 文件搜索）
+
+memory-lancedb（增强层，可选）
+  → 注册 memory_recall / memory_store / memory_forget 工具
+  → 后端：LanceDB 向量数据库 + OpenAI Embedding
+  → 提供 Auto-Recall 和 Auto-Capture 自动化能力
+```
+
+#### Auto-Recall（自动回忆）
+
+当 `autoRecall: true` 时，**每次用户发消息、Agent 开始思考之前**，插件会自动执行：
+
+1. 把用户消息通过 OpenAI Embedding API 转成向量
+2. 在 LanceDB 中做向量相似度搜索（取 top 3，阈值 0.3）
+3. 把搜到的相关记忆以 `<relevant-memories>` 标签注入到 Agent 上下文开头
+
+这是通过 `api.on("before_agent_start", ...)` 生命周期钩子实现的，是 **代码级强制执行**，不依赖 LLM 自觉。
+
+#### Auto-Capture（自动捕获）
+
+当 `autoCapture: true` 时，**每次 Agent 完成回复后**，插件会自动执行：
+
+1. 提取对话中所有用户消息（只看 `role: "user"`，防止自我污染）
+2. 通过规则引擎判断是否值得记忆（关键词匹配：remember、prefer、重要、邮箱、电话等）
+3. 排除噪音（太短 <10 字、太长 >500 字、prompt 注入攻击、系统内容）
+4. 用 Embedding 做去重（相似度 >0.95 = 重复，跳过）
+5. 自动分类（preference / decision / entity / fact / other）
+6. 存入 LanceDB（每次对话最多存 3 条）
+
+这是通过 `api.on("agent_end", ...)` 钩子实现的，同样是代码级执行。
+
+#### 为什么是"插件"而不是"Skills"？
+
+| 维度     | Plugin（OpenClaw 方式）        | Skill（提示词方式）            |
+| -------- | ------------------------------ | ------------------------------ |
+| 实现方式 | TypeScript 代码 + 生命周期钩子 | 纯 Markdown 指令注入系统提示词 |
+| 执行保证 | ✅ 100%，程序强制执行          | ⚠️ 依赖 LLM 注意力，可能遗忘   |
+| 搜索精度 | 向量相似度，数学确定性         | LLM 自行判断"要不要去读文件"   |
+| 安全防护 | prompt 注入检测 + 去重         | 无                             |
+
+**结论**：OpenClaw 的记忆是基础设施级能力，不是靠"教 LLM 怎么做"，而是靠代码在 LLM 推理前后自动完成。
+
 ---
 
 ## 0. 一页结论
@@ -77,12 +128,15 @@ memory 分两层，都是 workspace 目录下的普通 Markdown 文件：
 2. 看见 `dispatching to agent` 说明路由已经命中某个会话，下一步查工具或回传。
 3. 看见 `dispatch complete (queuedFinal=true` 说明主回复已排队，优先查发送权限或下游工具结果。
 4. `skipping duplicate message` 是幂等保护，不是消息丢失。
-5. `allowlist contains unknown entries` 多数是工具名写错或插件没启用，未必阻断消息主链路。
-6. 视频提取是异步任务，`已受理` 不等于 `马上回传结果`。
-7. 失败任务不会“自动补发成功结果”；要重新提交才能触发新任务。
-8. memory 是“可用工具”，不是“每次都必调工具”；问题不涉及历史记忆时可能不会调用。
+5. 视频提取是异步任务，`已受理` 不等于 `马上回传结果`。
+6. 失败任务不会“自动补发成功结果”；要重新提交才能触发新任务。
+7. memory 是“可用工具”，不是“每次都必调工具”；问题不涉及历史记忆时可能不会调用。
+8. Browser 报 `Chrome extension relay is running, but no tab is connected` 时，不是网关挂了，而是浏览器扩展还没 attach 到当前标签页。
+9. 没有 OpenClaw.app 也可以排障：全程用 CLI（`openclaw gateway run ...`、`openclaw browser extension install`）即可。
 
 ## 1. 先跑这 5 条命令
+
+> 如果你没有全局 `openclaw` 命令，请在仓库目录用 `pnpm openclaw ...` 执行同名命令。
 
 | 命令                               | 预期关键词                            | 如果不是这个结果                                 |
 | ---------------------------------- | ------------------------------------- | ------------------------------------------------ |
@@ -91,6 +145,31 @@ memory 分两层，都是 workspace 目录下的普通 Markdown 文件：
 | `openclaw logs --follow`           | `[ws] ws client ready`                | 先修飞书长连接/事件订阅                          |
 | `openclaw pairing list feishu`     | 能正常返回列表（可为空）              | 若报 `pairing required`，先重新配对当前 CLI 设备 |
 | `openclaw doctor`                  | 无阻断级错误                          | 按 doctor 建议先修服务/配置再回测                |
+
+## 1.1 Browser 报 no tab connected（CLI-only 快速修复）
+
+> 仅命令行环境可用，不依赖 OpenClaw.app。
+
+1. 启动/重启网关（前台调试）：
+
+   ```bash
+   openclaw gateway run --bind loopback --port 18789 --force
+   ```
+
+2. 安装浏览器扩展到稳定目录：
+
+   ```bash
+   openclaw browser extension install
+   ```
+
+   正常输出会给出路径：`~/.openclaw/browser/chrome-extension`
+
+3. 在 Chrome 打开 `chrome://extensions`，开启“开发者模式”，点击“加载已解压的扩展程序”，选择上一步路径。
+4. 在扩展选项页填写：
+   - Port：`18792`（默认）
+   - Gateway token：运行 `openclaw config get gateway.auth.token` 获取
+5. 在任意网页标签页点击 OpenClaw Browser Relay 图标，完成 attach（图标会显示 ON / attached）。
+6. 若看不到 `.openclaw` 目录：Finder 按 `Command + Shift + .` 显示隐藏文件，或直接在终端使用绝对路径。
 
 ## 2. 五层故障分层卡片
 
@@ -115,7 +194,7 @@ memory 分两层，都是 workspace 目录下的普通 Markdown 文件：
 - `正常`：无持续工具缺失告警；提问”上次我们讨论了什么”类问题时，日志中可见 `memory_search` 或 `memory_get` 执行记录。
 - `异常下一步`：
   1. 检查 `tools.alsoAllow` 是否包含 `memory_search`、`memory_get`
-  2. 检查 `plugins.slots.memory` 是否设为 `”memory-core”`
+  2. 检查 `plugins.slots.memory` 是否设为 `"memory-core"`
   3. 确认插件已启用（`openclaw doctor` 无 memory 相关阻断错误）
   4. **注意**：memory 是”可用工具”，不是”每次必调工具”。如果问题本身不涉及历史记忆（如”今天天气怎么样”），agent 不会调用 memory，这是正常行为，不是 bug。
 
@@ -198,12 +277,12 @@ openclaw logs --follow
 {
   plugins: {
     slots: {
-      memory: “memory-core”,  // 挂载 memory 插件
+      memory: "memory-core", // 挂载 memory 插件
     },
   },
   tools: {
-    profile: “minimal”,
-    alsoAllow: [“memory_search”, “memory_get”],  // 显式允许 memory 工具
+    profile: "minimal",
+    alsoAllow: ["memory_search", "memory_get"], // 显式允许 memory 工具
   },
 }
 ```

@@ -1,9 +1,13 @@
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const resolveFeishuAccountMock = vi.hoisted(() => vi.fn());
 const getFeishuRuntimeMock = vi.hoisted(() => vi.fn());
 const sendMessageFeishuMock = vi.hoisted(() => vi.fn());
 const sendMarkdownCardFeishuMock = vi.hoisted(() => vi.fn());
+const sendMediaFeishuMock = vi.hoisted(() => vi.fn());
 const createFeishuClientMock = vi.hoisted(() => vi.fn());
 const resolveReceiveIdTypeMock = vi.hoisted(() => vi.fn());
 const createReplyDispatcherWithTypingMock = vi.hoisted(() => vi.fn());
@@ -15,6 +19,7 @@ vi.mock("./send.js", () => ({
   sendMessageFeishu: sendMessageFeishuMock,
   sendMarkdownCardFeishu: sendMarkdownCardFeishuMock,
 }));
+vi.mock("./media.js", () => ({ sendMediaFeishu: sendMediaFeishuMock }));
 vi.mock("./client.js", () => ({ createFeishuClient: createFeishuClientMock }));
 vi.mock("./targets.js", () => ({ resolveReceiveIdType: resolveReceiveIdTypeMock }));
 vi.mock("./streaming-card.js", () => ({
@@ -55,6 +60,7 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
 
     resolveReceiveIdTypeMock.mockReturnValue("chat_id");
     createFeishuClientMock.mockReturnValue({});
+    sendMediaFeishuMock.mockResolvedValue({ messageId: "msg-media" });
 
     createReplyDispatcherWithTypingMock.mockImplementation((opts) => ({
       dispatcher: {},
@@ -94,6 +100,102 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
     expect(streamingInstances).toHaveLength(0);
     expect(sendMessageFeishuMock).toHaveBeenCalledTimes(1);
     expect(sendMarkdownCardFeishuMock).not.toHaveBeenCalled();
+  });
+
+  it("does not send non-final block payloads externally", async () => {
+    createFeishuReplyDispatcher({
+      cfg: {} as never,
+      agentId: "agent",
+      runtime: {} as never,
+      chatId: "oc_chat",
+    });
+
+    const options = createReplyDispatcherWithTypingMock.mock.calls[0]?.[0];
+    await options.deliver({ text: "处理中..." }, { kind: "block" });
+
+    expect(sendMessageFeishuMock).not.toHaveBeenCalled();
+    expect(sendMarkdownCardFeishuMock).not.toHaveBeenCalled();
+    expect(sendMediaFeishuMock).not.toHaveBeenCalled();
+  });
+
+  it("uses MEDIA markers first and strips marker lines from text", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "feishu-reply-test-"));
+    const imagePath = path.join(tmpDir, "screenshot_marker.png");
+    fs.writeFileSync(imagePath, "png");
+
+    createFeishuReplyDispatcher({
+      cfg: {} as never,
+      agentId: "agent",
+      runtime: { log: vi.fn() } as never,
+      chatId: "oc_chat",
+    });
+
+    const options = createReplyDispatcherWithTypingMock.mock.calls[0]?.[0];
+    await options.deliver({ text: `截图已经拍好了\nMEDIA: "${imagePath}"` }, { kind: "final" });
+
+    expect(sendMessageFeishuMock).toHaveBeenCalledWith(
+      expect.objectContaining({ to: "oc_chat", text: "截图已经拍好了" }),
+    );
+    expect(sendMediaFeishuMock).toHaveBeenCalledTimes(1);
+    expect(sendMediaFeishuMock).toHaveBeenCalledWith(
+      expect.objectContaining({ to: "oc_chat", mediaUrl: imagePath }),
+    );
+  });
+
+  it("infers local image path from text and sends media", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "feishu-reply-test-"));
+    const imagePath = path.join(tmpDir, "screenshot_now.png");
+    fs.writeFileSync(imagePath, "png");
+
+    createFeishuReplyDispatcher({
+      cfg: {} as never,
+      agentId: "agent",
+      runtime: { log: vi.fn() } as never,
+      chatId: "oc_chat",
+    });
+
+    const options = createReplyDispatcherWithTypingMock.mock.calls[0]?.[0];
+    await options.deliver({ text: `截图在 \`${imagePath}\`` }, { kind: "final" });
+
+    expect(sendMediaFeishuMock).toHaveBeenCalledTimes(1);
+    expect(sendMediaFeishuMock).toHaveBeenCalledWith(
+      expect.objectContaining({ to: "oc_chat", mediaUrl: imagePath }),
+    );
+  });
+
+  it("infers plain tmp image path from text and sends media", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "feishu-reply-test-"));
+    const imagePath = path.join(tmpDir, "screenshot_plain.png");
+    fs.writeFileSync(imagePath, "png");
+
+    createFeishuReplyDispatcher({
+      cfg: {} as never,
+      agentId: "agent",
+      runtime: { log: vi.fn() } as never,
+      chatId: "oc_chat",
+    });
+
+    const options = createReplyDispatcherWithTypingMock.mock.calls[0]?.[0];
+    await options.deliver({ text: `截图在 ${imagePath}` }, { kind: "final" });
+
+    expect(sendMediaFeishuMock).toHaveBeenCalledTimes(1);
+    expect(sendMediaFeishuMock).toHaveBeenCalledWith(
+      expect.objectContaining({ to: "oc_chat", mediaUrl: imagePath }),
+    );
+  });
+
+  it("does not infer non-existing local image path", async () => {
+    createFeishuReplyDispatcher({
+      cfg: {} as never,
+      agentId: "agent",
+      runtime: { log: vi.fn() } as never,
+      chatId: "oc_chat",
+    });
+
+    const options = createReplyDispatcherWithTypingMock.mock.calls[0]?.[0];
+    await options.deliver({ text: "截图在 `/tmp/not_exists_123456.png`" }, { kind: "final" });
+
+    expect(sendMediaFeishuMock).not.toHaveBeenCalled();
   });
 
   it("uses streaming session for auto mode markdown payloads", async () => {

@@ -1,6 +1,8 @@
 import fs from "fs";
+import os from "os";
 import path from "path";
 import { Readable } from "stream";
+import { fileURLToPath } from "url";
 import { withTempDownloadPath, type ClawdbotConfig } from "openclaw/plugin-sdk";
 import { resolveFeishuAccount } from "./accounts.js";
 import { createFeishuClient } from "./client.js";
@@ -375,6 +377,107 @@ export function detectFileType(
   }
 }
 
+const SENSITIVE_LOCAL_FILE_NAMES = [
+  ".env",
+  ".npmrc",
+  ".gitconfig",
+  ".bashrc",
+  ".zshrc",
+  "openclaw.json",
+  "clawdbot.json",
+  "id_rsa",
+  "id_ed25519",
+];
+
+const SENSITIVE_LOCAL_SEGMENT_PATTERNS = [
+  `${path.sep}.ssh${path.sep}`,
+  `${path.sep}.aws${path.sep}`,
+  `${path.sep}.gnupg${path.sep}`,
+  `${path.sep}.openclaw${path.sep}credentials${path.sep}`,
+  `${path.sep}.openclaw${path.sep}secrets${path.sep}`,
+  `${path.sep}.openclaw${path.sep}sessions${path.sep}`,
+  `${path.sep}.config${path.sep}`,
+];
+
+function normalizeLocalMediaPath(raw: string): string | undefined {
+  const trimmed = raw.replace(/^\s*MEDIA\s*:\s*/i, "").trim();
+  if (!trimmed) {
+    return undefined;
+  }
+  if (/^https?:\/\//i.test(trimmed) || /^data:/i.test(trimmed)) {
+    return undefined;
+  }
+
+  if (trimmed.startsWith("file://")) {
+    try {
+      return fileURLToPath(trimmed);
+    } catch {
+      return undefined;
+    }
+  }
+  if (trimmed.startsWith("~")) {
+    return path.resolve(trimmed.replace(/^~/, os.homedir()));
+  }
+  if (path.isAbsolute(trimmed)) {
+    return path.resolve(trimmed);
+  }
+  return undefined;
+}
+
+function resolveOutboundLocalRoots(cfg: ClawdbotConfig, configRoots?: string[]): string[] {
+  const roots = new Set<string>();
+  roots.add(path.resolve(os.tmpdir()));
+  roots.add(path.resolve("/tmp"));
+  const workspace = cfg.agents?.defaults?.workspace;
+  if (typeof workspace === "string" && workspace.trim()) {
+    roots.add(path.resolve(workspace.trim()));
+  }
+  for (const entry of configRoots ?? []) {
+    const trimmed = String(entry).trim();
+    if (!trimmed) {
+      continue;
+    }
+    const resolved = trimmed.startsWith("~")
+      ? path.resolve(trimmed.replace(/^~/, os.homedir()))
+      : path.resolve(trimmed);
+    roots.add(resolved);
+  }
+  return [...roots];
+}
+
+function isPathInsideRoot(localPath: string, root: string): boolean {
+  if (localPath === root) {
+    return true;
+  }
+  const rel = path.relative(root, localPath);
+  return Boolean(rel) && !rel.startsWith("..") && !path.isAbsolute(rel);
+}
+
+function assertSafeOutboundLocalPath(localPath: string, allowedRoots: readonly string[]): void {
+  const normalized = path.resolve(localPath);
+  const normalizedLower = normalized.toLowerCase();
+  const baseLower = path.basename(normalized).toLowerCase();
+  const hasSensitiveBaseName =
+    baseLower.startsWith(".env.") || SENSITIVE_LOCAL_FILE_NAMES.includes(baseLower);
+  if (hasSensitiveBaseName) {
+    throw new Error(`Feishu media send blocked: sensitive local file (${localPath})`);
+  }
+
+  const hasSensitiveSegment = SENSITIVE_LOCAL_SEGMENT_PATTERNS.some((pattern) =>
+    normalizedLower.includes(pattern.toLowerCase()),
+  );
+  if (hasSensitiveSegment) {
+    throw new Error(`Feishu media send blocked: sensitive local path (${localPath})`);
+  }
+
+  const allowed = allowedRoots.some((root) => isPathInsideRoot(normalized, path.resolve(root)));
+  if (!allowed) {
+    throw new Error(
+      `Feishu media send blocked: local file is outside outboundMediaLocalRoots (${localPath})`,
+    );
+  }
+}
+
 /**
  * Upload and send media (image or file) from URL, local path, or buffer
  */
@@ -401,9 +504,17 @@ export async function sendMediaFeishu(params: {
     buffer = mediaBuffer;
     name = fileName ?? "file";
   } else if (mediaUrl) {
+    const localPath = normalizeLocalMediaPath(mediaUrl);
+    const outboundLocalRoots = localPath
+      ? resolveOutboundLocalRoots(cfg, account.config?.outboundMediaLocalRoots)
+      : undefined;
+    if (localPath && outboundLocalRoots) {
+      assertSafeOutboundLocalPath(localPath, outboundLocalRoots);
+    }
     const loaded = await getFeishuRuntime().media.loadWebMedia(mediaUrl, {
       maxBytes: mediaMaxBytes,
       optimizeImages: false,
+      ...(outboundLocalRoots ? { localRoots: outboundLocalRoots } : {}),
     });
     buffer = loaded.buffer;
     name = fileName ?? loaded.fileName ?? "file";

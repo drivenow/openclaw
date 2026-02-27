@@ -1,0 +1,29 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pgrep:*)",
+      "Bash(ps:*)",
+      "Read(//Users/fullmetal/Documents/codes/RPA/bili2text/**)",
+      "Read(//Users/fullmetal/Documents/codes/RPA/**)",
+      "Read(//Users/fullmetal/.openclaw/**)",
+      "Bash(ls:*)",
+      "Bash(/Users/fullmetal/Documents/codes/RPA/yt-dlp_macos:*)",
+      "Bash(curl:*)",
+      "Bash(python3 -c \":*)",
+      "Bash(/Users/fullmetal/anaconda3/envs/py311/bin/python:*)",
+      "Bash(/Users/fullmetal/anaconda3/envs/py311/bin/playwright install:*)",
+      "Read(//Users/fullmetal/Downloads/**)",
+      "Read(//Users/fullmetal/Library/Containers/com.tencent.meeting/Data/Library/Global/Data/IM/file/2026-2/4108426388795904561/**)",
+      "Bash(node --version:*)",
+      "Bash(python demo_mcp.py:*)"
+    ],
+    "additionalDirectories": [
+      "/Users/fullmetal/Documents/codes/RPA",
+      "/Users/fullmetal/.openclaw",
+      "/Users/fullmetal/Library/Containers/com.tencent.meeting/Data/Library/Global/Data/IM/file/2026-2/4108426388795904561"
+    ]
+  },
+  "enabledPlugins": {
+    "code-review@claude-plugins-official": true
+  }
+}

@@ -3,6 +3,14 @@
     "rag-memory-server": {
       "command": "python3",
       "args": ["/Users/fullmetal/Documents/RAG/scripts/mcp_rag_server.py"]
+    },
+    "fs-openclaw": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-filesystem",
+        "/Users/fullmetal/Documents/codes/openclaw"
+      ]
     }
   },
   "imports": []
